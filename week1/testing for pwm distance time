@@ -1,0 +1,78 @@
+# -*- coding: utf-8 -*-
+import RPi.GPIO as GPIO
+import time
+
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+
+# --- MOTOR PINS ---
+IN1, IN2, ENA = 13, 15, 11
+IN3, IN4, ENB = 16, 18, 12
+
+GPIO.setup([IN1, IN2, ENA, IN3, IN4, ENB], GPIO.OUT)
+
+# --- PWM SETUP ---
+pwm_left = GPIO.PWM(ENA, 100)
+pwm_right = GPIO.PWM(ENB, 100)
+pwm_left.start(0)
+pwm_right.start(0)
+
+def set_motor_speed(left_pwm, right_pwm):
+    # Clamping between 0 and 100 to prevent GPIO errors
+    left_pwm = max(0, min(100, left_pwm))
+    right_pwm = max(0, min(100, right_pwm))
+    pwm_left.ChangeDutyCycle(left_pwm)
+    pwm_right.ChangeDutyCycle(right_pwm)
+
+def move_forward(pwm_value):
+    set_motor_speed(pwm_value, pwm_value)
+    # Adjust these True/False settings if your wheels spin backwards
+    GPIO.output(IN1, True)
+    GPIO.output(IN2, False)
+    GPIO.output(IN3, False)
+    GPIO.output(IN4, True)
+
+def stop():
+    GPIO.output([IN1, IN2, IN3, IN4], False)
+    set_motor_speed(0, 0)
+
+# --- CALIBRATION PROGRAM ---
+try:
+    print("\n--- RECALIBRATION MODE (WEIGHTED) ---")
+    print("This will help you find the new Speed vs. PWM constants.")
+    
+    # User inputs raw PWM instead of target speed
+    target_pwm = float(input("Enter PWM to test (0-100): "))
+    duration = float(input("Enter duration (seconds): "))
+
+    print(f"\nRunning at {target_pwm}% PWM for {duration}s...")
+    print("READY... SET... GO!")
+    
+    start_time = time.time()
+    while time.time() - start_time < duration:
+        move_forward(target_pwm)
+        time.sleep(0.02)
+
+    stop()
+    actual_duration = time.time() - start_time
+    
+    print("\n" + "="*30)
+    print("       TEST FINISHED")
+    print("="*30)
+    print(f"PWM Used:       {target_pwm}%")
+    print(f"Actual Time:    {actual_duration:.2f} s")
+    print("-" * 30)
+    print("NEXT STEPS:")
+    print("1. Measure the distance the car traveled (in meters).")
+    print(f"2. Calculate speed: Speed = Distance / {actual_duration:.2f}")
+    print("3. Repeat for 3 different PWM values (e.g., 40, 60, 80).")
+    print("4. Use those points to find your new M and C constants.")
+    print("="*30)
+
+except KeyboardInterrupt:
+    print("\nEmergency Stop")
+finally:
+    stop()
+    pwm_left.stop()
+    pwm_right.stop()
+    GPIO.cleanup()
