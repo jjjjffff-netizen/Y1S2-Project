@@ -1,0 +1,127 @@
+# -*- coding: utf-8 -*-
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+
+# --- GPIO & MOTOR SETUP ---
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+
+# Pins from your movement logic
+IN1, IN2, ENA = 13, 15, 11
+IN3, IN4, ENB = 16, 18, 12
+SERVO_PIN = 8
+
+GPIO.setup([IN1, IN2, ENA, IN3, IN4, ENB, SERVO_PIN], GPIO.OUT)
+
+# 1000Hz PWM for smoother torque on weighted car
+pwm_left = GPIO.PWM(ENA, 1000)
+pwm_right = GPIO.PWM(ENB, 1000)
+pwm_camera = GPIO.PWM(SERVO_PIN, 50)
+
+pwm_left.start(0)
+pwm_right.start(0)
+pwm_camera.start(0)
+
+# --- CONFIGURATION ---
+BASE_SPEED = 35         # Slower base speed helps with momentum
+STEER_SENSITIVITY = 0.5 # Higher = sharper response, lower = smoother
+SEARCH_SPEED = 45       # Speed used to spin and find the line
+CAM_ANGLE = 90          # Now that you've tuned it, 90 is your true center
+
+last_direction = "center" 
+
+# --- FUNCTIONS ---
+
+def set_camera_angle(angle):
+    """Sets the swivel angle (0-180). 90 is now perfectly centered."""
+    angle = max(0, min(180, angle))
+    duty = 2 + (angle / 18)
+    pwm_camera.ChangeDutyCycle(duty)
+    time.sleep(0.4)
+    pwm_camera.ChangeDutyCycle(0) # Stop jittering
+
+def set_motors(left, right, l_fwd=True, r_fwd=True):
+    """Handles motor speed and direction based on your wiring."""
+    pwm_left.ChangeDutyCycle(max(0, min(100, left)))
+    pwm_right.ChangeDutyCycle(max(0, min(100, right)))
+    
+    # Left Motor
+    GPIO.output(IN1, l_fwd)
+    GPIO.output(IN2, not l_fwd)
+    # Right Motor
+    GPIO.output(IN3, not r_fwd)
+    GPIO.output(IN4, r_fwd)
+
+def stop():
+    GPIO.output([IN1, IN2, IN3, IN4], False)
+    pwm_left.ChangeDutyCycle(0)
+    pwm_right.ChangeDutyCycle(0)
+
+# --- CAMERA SETUP ---
+picam2 = Picamera2()
+config = picam2.create_video_configuration(main={"size": (160, 120)})
+picam2.configure(config)
+picam2.start()
+
+try:
+    print("Centering Swivel Stand...")
+    set_camera_angle(CAM_ANGLE)
+    print("System Ready. Tracking line...")
+
+    while True:
+        frame = picam2.capture_array()
+        if frame is None: continue
+
+        # 1. PRE-PROCESS IMAGE
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Binary Threshold: isolating the black line
+        _, thresh = cv2.threshold(blur, 60, 255, cv2.THRESH_BINARY_INV)
+
+        # 2. ANALYZE LINE POSITION
+        # Focusing on the bottom half of the image for stability
+        mask = thresh[60:120, 0:160]
+        M = cv2.moments(mask)
+
+        if M['m00'] > 400: # We see a significant black object (the line)
+            cx = int(M['m10'] / M['m00'])
+            error = cx - 80 # Distance from center of 160px width
+            
+            # Remember direction in case we lose the line in the next frame
+            if error > 15: last_direction = "right"
+            elif error < -15: last_direction = "left"
+            else: last_direction = "center"
+
+            # 3. PROPORTIONAL CONTROL (P-Control)
+            correction = STEER_SENSITIVITY * error
+            set_motors(BASE_SPEED + correction, BASE_SPEED - correction)
+            
+            # Visual Debugging (Green circle on tracking point)
+            cv2.circle(frame, (cx, 90), 5, (0, 255, 0), -1)
+        
+        else:
+            # --- 4. SEARCH LOGIC ---
+            # If the line is gone, spin in the direction it was last seen
+            if last_direction == "right":
+                set_motors(SEARCH_SPEED, SEARCH_SPEED, l_fwd=True, r_fwd=False)
+            elif last_direction == "left":
+                set_motors(SEARCH_SPEED, SEARCH_SPEED, l_fwd=False, r_fwd=True)
+            else:
+                # If we were centered and lost it, just stop to be safe
+                stop()
+
+        # Show the video feed
+        cv2.imshow("Arducam Line Follower", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+except KeyboardInterrupt:
+    print("\nEmergency Stop Triggered.")
+finally:
+    stop()
+    picam2.stop()
+    pwm_camera.stop()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
