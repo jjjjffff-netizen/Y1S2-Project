@@ -1,0 +1,248 @@
+# -*- coding: utf-8 -*-
+
+# --- PYTHON 3.13 FIX ---
+import sys
+import importlib.util
+
+class FakeImp:
+    def find_module(self, name):
+        # Check if the module exists the modern way
+        if importlib.util.find_spec(name) is None:
+            raise ImportError(f"No module named {name}")
+        return (None, None, None) # Return a fake tuple to satisfy flatbuffers
+
+sys.modules['imp'] = FakeImp()
+
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+from tensorflow.lite.python import interpreter as tflite # Change to from tensorflow.lite.python import interpreter as tflite if using the full package
+
+# --- GPIO & MOTOR SETUP ---
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+
+IN1, IN2, ENA = 18, 16, 12
+IN3, IN4, ENB = 11, 15, 13
+SERVO_PIN = 19
+
+GPIO.setup([IN1, IN2, ENA, IN3, IN4, ENB, SERVO_PIN], GPIO.OUT)
+
+pwm_left = GPIO.PWM(ENA, 1000)
+pwm_right = GPIO.PWM(ENB, 1000)
+pwm_camera = GPIO.PWM(SERVO_PIN, 50)
+
+pwm_left.start(0)
+pwm_right.start(0)
+pwm_camera.start(0)
+
+# --- CONFIGURATION ---
+BASE_SPEED = 40          # Speed for driving straight
+TURN_SPEED = 100         # Speed for the reversing wheels during a turn
+TURN_THRESHOLD = 20      # How many pixels off-centre before the car decides to turn
+CENTER_ANGLE = 90.0
+
+# --- SCANNING CONFIGURATION ---
+SPIN_SPEED = 100         # Speed for the wheels when doing a 360 scan
+
+# --- AI & TEMPLATE CONFIGURATION ---
+MODEL_PATH = 'model.tflite'
+LABELS_PATH = 'labels.txt'
+AI_CONFIDENCE_THRESHOLD = 0.85
+TEMPLATE_THRESHOLD = 0.70 # 70% match required for arrows
+
+# --- LOAD AI MODEL ---
+print("Loading Teachable Machine Model...")
+try:
+    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    with open(LABELS_PATH, 'r') as f:
+        labels = [line.strip() for line in f.readlines()]
+except Exception as e:
+    print(f"Warning: Could not load AI model. Error: {e}")
+
+# --- LOAD TEMPLATES ---
+print("Loading Arrow Templates...")
+templates = {
+    "Up arrow": cv2.imread("up_arrow.png", 0),
+    "Down arrow": cv2.imread("down_arrow.png", 0),
+    "Left arrow": cv2.imread("left_arrow.png", 0),
+    "Right arrow": cv2.imread("right_arrow.png", 0)
+}
+
+# --- FUNCTIONS ---
+def set_camera_angle_direct(angle):
+    duty = 2 + (angle / 18)
+    pwm_camera.ChangeDutyCycle(duty)
+
+def set_motors_smart(left_speed, right_speed):
+    # Left Motor Logic
+    if left_speed >= 0:
+        GPIO.output(IN1, True); GPIO.output(IN2, False)
+    else:
+        GPIO.output(IN1, False); GPIO.output(IN2, True)
+        left_speed = abs(left_speed)
+
+    # Right Motor Logic
+    if right_speed >= 0:
+        GPIO.output(IN3, False); GPIO.output(IN4, True)
+    else:
+        GPIO.output(IN3, True); GPIO.output(IN4, False)
+        right_speed = abs(right_speed)
+
+    pwm_left.ChangeDutyCycle(max(0, min(100, left_speed)))
+    pwm_right.ChangeDutyCycle(max(0, min(100, right_speed)))
+
+def stop():
+    GPIO.output([IN1, IN2, IN3, IN4], False)
+    pwm_left.ChangeDutyCycle(0)
+    pwm_right.ChangeDutyCycle(0)
+    
+# --- CAMERA SETUP ---
+picam2 = Picamera2()
+config = picam2.create_video_configuration(main={"size": (160, 120)})
+picam2.configure(config)
+picam2.start()
+
+try:
+    print("Initialising camera to centre (90 degrees)...")
+    set_camera_angle_direct(CENTER_ANGLE)
+    time.sleep(1) 
+    
+    # Kill the software PWM signal to prevent servo twitching
+    pwm_camera.ChangeDutyCycle(0) 
+    
+    print("Starting Multi-Vision Tracking & 360 Scan Recovery!")
+    
+    last_seen_direction = 1  # 1 means right, -1 means left. Defaults to right.
+
+    while True:
+        frame = picam2.capture_array()
+        if frame is None: continue
+
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        
+        action_triggered = False # Flag to pause line tracking if a symbol is found
+
+        # ==========================================
+        # 1. TEMPLATE MATCHING (Arrows)
+        # ==========================================
+        for arrow_name, template in templates.items():
+            if template is None: continue # Skip if image didn't load properly
+            
+            # Slide the template over the frame and calculate matches
+            result = cv2.matchTemplate(gray_frame, template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            
+            if max_val >= TEMPLATE_THRESHOLD:
+                stop()
+                print(f"{arrow_name} detected!") 
+                cv2.putText(frame_bgr, f"MATCH: {arrow_name}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.imshow("Arducam Feed", frame_bgr)
+                cv2.waitKey(1)
+                
+                # Pause to prevent console spam
+                time.sleep(1) 
+                
+                action_triggered = True
+                break # Stop checking other templates
+# ==========================================
+        # 2. AI DETECTION (Other Symbols)
+        # ==========================================
+        # Only run the heavy AI maths if we didn't just find an arrow
+        if not action_triggered:
+            input_shape = input_details[0]['shape']
+            
+            # --- THE FIX: Strip the 4th channel if it exists! ---
+            if frame.shape[-1] == 4:
+                rgb_frame = frame[:, :, :3] # Keep only the first 3 channels (R, G, B)
+            else:
+                rgb_frame = frame
+                
+            # Use the newly cleaned 3-channel image for the AI
+            resized_img = cv2.resize(rgb_frame, (input_shape[1], input_shape[2]))
+            
+            input_data = np.expand_dims(resized_img, axis=0)
+            input_data = (np.float32(input_data) / 127.5) - 1.0 
+
+            interpreter.set_tensor(input_details[0]['index'], input_data)
+            interpreter.invoke()
+            output_data = interpreter.get_tensor(output_details[0]['index'])
+            
+            top_prediction_index = np.argmax(output_data[0])
+            confidence = output_data[0][top_prediction_index]
+            detected_label = labels[top_prediction_index]
+            
+            clean_label = ''.join([i for i in detected_label if not i.isdigit()]).strip()
+
+            # --- DEBUGGING OVERLAY ---
+            cv2.putText(frame_bgr, f"AI Sees: {clean_label} ({confidence*100:.0f}%)", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+            # Assuming your background class has the word "Background" in it
+            if confidence > AI_CONFIDENCE_THRESHOLD and "Background" not in detected_label:
+                stop()
+                
+                print(f"{clean_label} detected!") 
+                cv2.putText(frame_bgr, f"ACTION: {clean_label}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.imshow("Arducam Feed", frame_bgr)
+                cv2.waitKey(1)
+                
+                time.sleep(1)
+                action_triggered = True
+            # ==========================================
+        # 3. LINE TRACKING & SCANNING LOGIC
+        # ==========================================
+        # Only track the line if no symbols or arrows are commanding the car
+        if not action_triggered:
+            blur = cv2.GaussianBlur(gray_frame, (5, 5), 0)
+            _, thresh = cv2.threshold(blur, 60, 255, cv2.THRESH_BINARY_INV)
+
+            M = cv2.moments(thresh[60:120, 0:160])
+
+            if M['m00'] > 20000:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00']) + 60 
+                
+                pixel_error = cx - 80 
+                
+                # --- UPDATE MEMORY OF THE LINE'S LOCATION ---
+                if pixel_error < -10:
+                    last_seen_direction = -1 # Line is firmly on the left
+                elif pixel_error > 10:
+                    last_seen_direction = 1  # Line is firmly on the right
+
+                # --- EXPLICIT PIVOT STEERING LOGIC ---
+                if pixel_error < -TURN_THRESHOLD:
+                    set_motors_smart(-TURN_SPEED, TURN_SPEED)
+                elif pixel_error > TURN_THRESHOLD:
+                    set_motors_smart(TURN_SPEED, -TURN_SPEED)
+                else:
+                    set_motors_smart(BASE_SPEED, BASE_SPEED)
+
+                cv2.circle(frame_bgr, (cx, cy), 7, (0, 255, 0), -1)
+                
+            else:
+                # --- LINE LOST: 360 SCAN RECOVERY MODE ---
+                if last_seen_direction == -1:
+                    set_motors_smart(-SPIN_SPEED, SPIN_SPEED)
+                else:
+                    set_motors_smart(SPIN_SPEED, -SPIN_SPEED)
+                
+            cv2.imshow("Arducam Feed", frame_bgr)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+except KeyboardInterrupt:
+    print("\nStopping...")
+finally:
+    stop()
+    picam2.stop()
+    pwm_camera.stop()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
