@@ -1,0 +1,72 @@
+import cv2
+import os
+import numpy as np
+from datetime import datetime
+from picamera2 import Picamera2
+
+# --- CONFIGURATION ---
+# Create a folder to store the images
+SAVE_DIR = "captured_images"
+if not os.path.exists(SAVE_DIR):
+    os.makedirs(SAVE_DIR)
+
+# 1. Initialise the Camera
+print("Initialising Camera...")
+picam2 = Picamera2()
+
+# Setting a higher resolution for clear photos (you can change this to 160x120 if you want exact robot vision)
+config = picam2.create_video_configuration(main={"size": (640, 480)})
+picam2.configure(config)
+picam2.start()
+
+print("\n📸 Camera Ready!")
+print(" -> Press SPACEBAR to take a picture.")
+print(" -> Press 'q' to quit the program.\n")
+
+image_counter = 1
+
+try:
+    while True:
+        # Grab the current frame
+        frame = picam2.capture_array()
+        
+        # Picamera2 outputs RGB, but OpenCV uses BGR. We must convert it, 
+        # otherwise red and blue will be swapped in your saved images!
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        # Display the live feed
+        cv2.imshow("Live Camera Feed (Press SPACE to snap)", frame_bgr)
+
+        # Listen for keystrokes (wait 1 millisecond per frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        # --- SPACEBAR PRESSED (ASCII value 32) ---
+        if key == 32:
+            # Create a unique filename using the current time
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{SAVE_DIR}/img_{timestamp}_{image_counter}.png"
+            
+            # Save the PNG
+            cv2.imwrite(filename, frame_bgr)
+            print(f"✅ SNAP! Saved: {filename}")
+            
+            image_counter += 1
+            
+            # Optional: Create a quick "white flash" on screen so you know it worked
+            flash = np.ones(frame_bgr.shape, dtype=np.uint8) * 255
+            cv2.imshow("Live Camera Feed (Press SPACE to snap)", flash)
+            cv2.waitKey(50) # Hold the flash for 50ms
+
+        # --- 'Q' PRESSED ---
+        elif key == ord('q'):
+            print("\nShutting down...")
+            break
+
+except KeyboardInterrupt:
+    print("\nCtrl+C detected. Shutting down...")
+
+finally:
+    # Always clean up hardware resources
+    picam2.stop()
+    cv2.destroyAllWindows()
+    print("Camera safely closed.")
