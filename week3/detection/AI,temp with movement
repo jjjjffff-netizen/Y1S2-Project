@@ -1,0 +1,639 @@
+# -*- coding: utf-8 -*-
+
+# --- PYTHON 3.13 FIX ---
+import sys
+import importlib.util
+
+class FakeImp:
+    def find_module(self, name):
+        if importlib.util.find_spec(name) is None:
+            raise ImportError(f"No module named {name}")
+        return (None, None, None) 
+
+sys.modules['imp'] = FakeImp()
+# -----------------------
+
+import threading
+import time
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+from picamera2 import Picamera2
+from tensorflow.lite.python import interpreter as tflite 
+
+# --- GPIO & MOTOR SETUP ---
+GPIO.setmode(GPIO.BOARD)
+GPIO.setwarnings(False)
+
+IN1, IN2, ENA = 18, 16, 12
+IN3, IN4, ENB = 11, 15, 13
+GPIO.setup([IN1, IN2, ENA, IN3, IN4, ENB], GPIO.OUT)
+
+pwm_left = GPIO.PWM(ENA, 1000)
+pwm_right = GPIO.PWM(ENB, 1000)
+pwm_left.start(0)
+pwm_right.start(0)
+
+# --- CONFIGURATION ---
+BASE_SPEED = 35         
+TURN_SPEED = 60          # Power used for the forward/reverse tank turns
+CENTER_TOLERANCE = 20    # How many pixels off-centre before the car aggressively pivots
+
+APPROACH_THRESHOLD = 40.0 # Kept for Veto logic
+
+SPIN_SPEED = 95          
+CROSSROAD_THRESHOLD = 50000 
+LINE_PIXEL_MIN = 5000    
+
+# --- COLOUR TRACKING THRESHOLDS ---
+COLOR_PIXEL_MIN = 500   
+
+LOWER_RED1 = np.array([0, 120, 120])
+UPPER_RED1 = np.array([10, 255, 255])
+LOWER_RED2 = np.array([160, 120, 120])
+UPPER_RED2 = np.array([180, 255, 255])
+
+LOWER_YELLOW = np.array([20, 120, 120])
+UPPER_YELLOW = np.array([40, 255, 255])
+
+# --- CONSENSUS FILTER ---
+REQUIRED_DETECTIONS = 1  
+
+MODEL_PATH = 'model.tflite'
+LABELS_PATH = 'labels.txt'
+TEMPLATE_THRESHOLD = 0.85 
+AI_CONFIDENCE_THRESHOLD = 0.85
+
+# --- SHARED STATE ARCHITECTURE ---
+class SharedState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = True
+        self.frame = None
+        
+        # UI Data for the Main GUI Thread
+        self.display_frame = None
+        self.ai_crop_frame = None
+        self.tmp_display_frame = None 
+        self.ai_overlay_text = "AI: Waiting..."
+        
+        self.left_speed = 0
+        self.right_speed = 0
+        
+        self.detected_symbol = None  
+        self.arrow_memory = None     
+        self.at_crossroad = False    
+        
+        # DECOUPLED BLINDNESS TIMERS
+        self.ignore_ai_until = 0.0   
+        self.ignore_tmp_until = 0.0  
+        self.blind_pid_until = 0.0
+        self.blind_pid_direction = 1
+
+state = SharedState()
+
+# --- LOAD AI & TEMPLATES ---
+print("Initialising Models...")
+try:
+    interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    input_dtype = input_details[0]['dtype']
+
+    with open(LABELS_PATH, 'r') as f:
+        labels = [line.strip() for line in f.readlines()]
+except Exception as e:
+    print(f"Error loading models: {e}")
+    sys.exit(1)
+
+def load_and_process_template(filepath):
+    img = cv2.imread(filepath, 0)
+    if img is None: return None
+    _, thresh = cv2.threshold(img, 240, 255, cv2.THRESH_BINARY_INV)
+    x, y, w, h = cv2.boundingRect(thresh)
+    cropped = img[y:y+h, x:x+w] if (w > 0 and h > 0) else img
+    return cv2.resize(cropped, (40, 40))
+
+templates = {
+    "Left arrow": load_and_process_template("left_arrow.png"),
+    "Right arrow": load_and_process_template("right_arrow.png")
+}
+SCALES = np.linspace(0.6, 1.4, 5)
+
+# --- HELPER FUNCTIONS ---
+def set_motor(left_speed, right_speed):
+    if left_speed >= 0:
+        GPIO.output(IN1, True); GPIO.output(IN2, False)
+    else:
+        GPIO.output(IN1, False); GPIO.output(IN2, True)
+        left_speed = abs(left_speed)
+
+    if right_speed >= 0:
+        GPIO.output(IN3, False); GPIO.output(IN4, True)
+    else:
+        GPIO.output(IN3, True); GPIO.output(IN4, False)
+        right_speed = abs(right_speed)
+
+    pwm_left.ChangeDutyCycle(max(0, min(100, left_speed)))
+    pwm_right.ChangeDutyCycle(max(0, min(100, right_speed)))
+
+# ==========================================
+# THREAD 1: THE SPINAL CORD (30 FPS)
+# ==========================================
+def thread_line_follow():
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(main={"size": (160, 120)})
+    picam2.configure(config)
+    picam2.start()
+    
+    last_direction = 1 
+    color_entry_direction = 1  
+    color_track_frames = 0  
+    last_color_seen = None # --- NEW: Tracks if we were on Red or Yellow
+    
+    while state.running:
+        frame = picam2.capture_array()
+        if frame is None: continue
+        
+        with state.lock:
+            b_until = state.blind_pid_until
+            b_dir = state.blind_pid_direction
+            
+        current_base = BASE_SPEED
+        
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Draw visual markers for the deadzone
+        cv2.line(frame_bgr, (80 - CENTER_TOLERANCE, 0), (80 - CENTER_TOLERANCE, 120), (255, 255, 255), 1)
+        cv2.line(frame_bgr, (80 + CENTER_TOLERANCE, 0), (80 + CENTER_TOLERANCE, 120), (255, 255, 255), 1)
+
+        # ----------------------------------------------------
+        # THE BLIND SWEEP TIMER
+        # ----------------------------------------------------
+        if time.time() < b_until:
+            is_crossroad = False
+            
+            if b_dir == -1:
+                l_speed, r_speed = -SPIN_SPEED, SPIN_SPEED
+            else:
+                l_speed, r_speed = SPIN_SPEED, -SPIN_SPEED
+                
+            time_left = b_until - time.time()
+            cv2.putText(frame_bgr, f"BLIND SWEEP ({time_left:.1f}s)", (5, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            
+            with state.lock:
+                state.frame = frame.copy()
+                state.display_frame = frame_bgr.copy() 
+                state.left_speed = l_speed
+                state.right_speed = r_speed
+                state.at_crossroad = is_crossroad
+
+            time.sleep(0.01)
+            continue 
+
+        # ----------------------------------------------------
+        # 1. HIERARCHY PREP: Create Masks for Black and Colour
+        # ----------------------------------------------------
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh_black = cv2.threshold(blur, 60, 255, cv2.THRESH_BINARY_INV)
+
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        mask_r1 = cv2.inRange(hsv, LOWER_RED1, UPPER_RED1)
+        mask_r2 = cv2.inRange(hsv, LOWER_RED2, UPPER_RED2)
+        mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+        mask_yellow = cv2.inRange(hsv, LOWER_YELLOW, UPPER_YELLOW)
+
+        mask_red[:, :40] = 0
+        mask_red[:, 120:] = 0
+        mask_yellow[:, :40] = 0
+        mask_yellow[:, 120:] = 0
+
+        M_black = cv2.moments(thresh_black[60:120, 0:160])
+        M_red = cv2.moments(mask_red[60:120, 0:160])
+        M_yellow = cv2.moments(mask_yellow[60:120, 0:160])
+        
+        color_pixel_count = M_red['m00'] + M_yellow['m00']
+
+        is_crossroad = False
+
+        # ----------------------------------------------------
+        # 2. PRIORITY STEERING LOGIC (PURE BANG-BANG)
+        # ----------------------------------------------------
+        if color_pixel_count > COLOR_PIXEL_MIN:
+            # PRIORITY 1: COLOUR HAS OVERRIDE
+            color_track_frames += 1  
+            
+            if M_red['m00'] > M_yellow['m00']:
+                active_M = M_red
+                last_color_seen = 'RED' # Remember we are on red
+                cv2.putText(frame_bgr, "TRACK: RED", (5, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                dot_color = (0, 0, 255)
+            else:
+                active_M = M_yellow
+                last_color_seen = 'YELLOW' # Remember we are on yellow
+                cv2.putText(frame_bgr, "TRACK: YELLOW", (5, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                dot_color = (0, 255, 255)
+
+            cx = int(active_M['m10'] / active_M['m00'])
+            cy = int(active_M['m01'] / active_M['m00']) + 60 
+            
+            if color_track_frames == 1:
+                color_entry_direction = -1 if cx < 80 else 1
+            
+            # --- PURE BANG-BANG TANK STEERING ---
+            if cx < (80 - CENTER_TOLERANCE): 
+                last_direction = -1 
+                l_speed = -TURN_SPEED
+                r_speed = TURN_SPEED
+            elif cx > (80 + CENTER_TOLERANCE): 
+                last_direction = 1  
+                l_speed = TURN_SPEED
+                r_speed = -TURN_SPEED
+            else:
+                l_speed = current_base
+                r_speed = current_base
+            
+            cv2.circle(frame_bgr, (cx, cy), 7, dot_color, -1) 
+
+        elif M_black['m00'] > LINE_PIXEL_MIN:
+            # PRIORITY 2: BLACK LINE
+            is_crossroad = M_black['m00'] > CROSSROAD_THRESHOLD
+
+            with state.lock:
+                arrow = state.arrow_memory
+                
+            if arrow is not None and is_crossroad:
+                blind_merge_until = time.time() + 0.6  
+                last_direction = -1 if arrow == 'LEFT' else 1
+                with state.lock:
+                    state.arrow_memory = None
+                continue
+
+            # --- COLOUR EXIT TRANSITION ---
+            if color_track_frames > 10:
+                if last_color_seen == 'RED':
+                    # Send signal to motor thread to execute hard 90 degree turn
+                    with state.lock:
+                        state.detected_symbol = 'RED_EXIT_RIGHT'
+                else:
+                    last_direction = color_entry_direction
+                    
+                color_track_frames = 0
+                last_color_seen = None
+            else:
+                color_track_frames = 0
+
+            cx = int(M_black['m10'] / M_black['m00'])
+            cy = int(M_black['m01'] / M_black['m00']) + 60 
+            
+            # --- PURE BANG-BANG TANK STEERING ---
+            if cx < (80 - CENTER_TOLERANCE): 
+                last_direction = -1 
+                l_speed = -TURN_SPEED
+                r_speed = TURN_SPEED
+            elif cx > (80 + CENTER_TOLERANCE): 
+                last_direction = 1  
+                l_speed = TURN_SPEED
+                r_speed = -TURN_SPEED
+            else:
+                l_speed = current_base
+                r_speed = current_base
+            
+            cv2.circle(frame_bgr, (cx, cy), 7, (0, 255, 0), -1) 
+            cv2.putText(frame_bgr, "TRACK: BLACK", (5, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            
+        else:
+            # PRIORITY 3: LOST
+            # --- COLOUR EXIT TRANSITION ---
+            if color_track_frames > 10:
+                if last_color_seen == 'RED':
+                    with state.lock:
+                        state.detected_symbol = 'RED_EXIT_RIGHT'
+                else:
+                    last_direction = color_entry_direction
+                    
+                color_track_frames = 0
+                last_color_seen = None
+            else:
+                color_track_frames = 0
+
+            # Normal Recovery Spin
+            if last_direction == -1:
+                l_speed, r_speed = -SPIN_SPEED, SPIN_SPEED
+            else:
+                l_speed, r_speed = SPIN_SPEED, -SPIN_SPEED
+            cv2.putText(frame_bgr, "TRACK: LOST (SPINNING)", (5, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+        with state.lock:
+            state.frame = frame.copy()
+            state.display_frame = frame_bgr.copy() 
+            state.left_speed = l_speed
+            state.right_speed = r_speed
+            state.at_crossroad = is_crossroad
+
+        time.sleep(0.01)
+
+    picam2.stop()
+
+# ==========================================
+# THREAD 2: THE BRAIN (CNN & Templates)
+# ==========================================
+def thread_symbol_detect():
+    detection_history = []
+    
+    while state.running:
+        with state.lock:
+            frame = state.frame
+            ign_ai = time.time() < state.ignore_ai_until
+            ign_tmp = time.time() < state.ignore_tmp_until
+            
+        if frame is None:
+            time.sleep(0.1)
+            continue
+            
+        if ign_ai and ign_tmp:
+            with state.lock:
+                state.ai_overlay_text = "AI & TMP: BLINDED"
+            detection_history.clear() 
+            time.sleep(0.1)
+            continue
+            
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        
+        ai_conf_pct = 0.0; ai_label = "None"
+        tmp_conf_pct = 0.0; tmp_label = "None"
+
+        # 1. RUN AI 
+        if not ign_ai:
+            try:
+                rgb_frame = frame[:, :, :3] if frame.shape[-1] == 4 else frame
+                h, w = rgb_frame.shape[:2]
+                start_x = (w - h) // 2 
+                square_rgb = rgb_frame[:, start_x:start_x+h]
+                
+                input_shape = input_details[0]['shape']
+                resized = cv2.resize(square_rgb, (input_shape[1], input_shape[2]))
+                input_data = np.expand_dims(resized, axis=0)
+                
+                if input_dtype == np.float32: input_data = (np.float32(input_data) / 127.5) - 1.0 
+                else: input_data = np.uint8(input_data)
+
+                interpreter.set_tensor(input_details[0]['index'], input_data)
+                interpreter.invoke()
+                out = interpreter.get_tensor(output_details[0]['index'])
+                
+                top_idx = np.argmax(out[0])
+                conf = (out[0][top_idx] / 255.0) if input_dtype == np.uint8 else out[0][top_idx]
+                label = ''.join([i for i in labels[top_idx] if not i.isdigit()]).strip()
+                
+                ai_conf_pct = conf * 100.0
+                ai_label = label
+                    
+                with state.lock:
+                    state.ai_crop_frame = cv2.cvtColor(square_rgb, cv2.COLOR_RGB2BGR)
+                    color = "AI: Background" if "Background" in label else f"AI: {label} ({conf*100:.1f}%)"
+                    state.ai_overlay_text = color
+            except: pass
+        else:
+            with state.lock:
+                state.ai_overlay_text = "AI: BLINDED"
+
+        # 2. RUN TEMPLATES 
+        if not ign_tmp:
+            best_conf = 0.0; best_arrow = None
+            best_loc = None; best_shape = None
+            
+            for name, tmpl in templates.items():
+                if tmpl is None: continue 
+                for scale in SCALES:
+                    w_t, h_t = int(tmpl.shape[1] * scale), int(tmpl.shape[0] * scale)
+                    if w_t > gray_frame.shape[1] or h_t > gray_frame.shape[0]: continue
+                        
+                    res = cv2.matchTemplate(gray_frame, cv2.resize(tmpl, (w_t, h_t)), cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                    
+                    if max_val > best_conf:
+                        best_conf = max_val
+                        best_arrow = name
+                        best_loc = max_loc
+                        best_shape = (w_t, h_t)
+                        
+            if best_arrow:
+                tmp_conf_pct = best_conf * 100.0
+                tmp_label = best_arrow
+
+            # --- CREATE VISUAL FOR TEMPLATE MATCHING ---
+            tmp_viz = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR) 
+            
+            if tmp_conf_pct >= APPROACH_THRESHOLD and best_loc is not None:
+                cv2.rectangle(tmp_viz, best_loc, (best_loc[0] + best_shape[0], best_loc[1] + best_shape[1]), (0, 255, 0), 1)
+                cv2.putText(tmp_viz, f"TMP: {tmp_label} ({tmp_conf_pct:.1f}%)", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            else:
+                cv2.putText(tmp_viz, "TMP: Scanning...", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+                
+            with state.lock:
+                state.tmp_display_frame = tmp_viz
+        else:
+            tmp_viz = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR) 
+            cv2.putText(tmp_viz, "TMP: BLINDED", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            with state.lock:
+                state.tmp_display_frame = tmp_viz
+
+        # ==========================================
+        # 3. THE FRAME DUEL (THE VETO SYSTEM)
+        # ==========================================
+        current_command = None
+        
+        if ai_conf_pct >= tmp_conf_pct and ai_conf_pct >= (AI_CONFIDENCE_THRESHOLD * 100.0):
+            if ai_label and ("button" in ai_label.lower() or "danger" in ai_label.lower()):
+                current_command = 'STOP'
+            elif ai_label and "recycle" in ai_label.lower():
+                current_command = '360'
+            else:
+                current_command = 'VETO'
+                
+        elif tmp_conf_pct > ai_conf_pct and tmp_conf_pct >= (TEMPLATE_THRESHOLD * 100.0):
+            if "Left" in tmp_label:
+                current_command = 'LEFT'
+            elif "Right" in tmp_label:
+                current_command = 'RIGHT'
+                
+        elif ai_conf_pct >= tmp_conf_pct and ai_conf_pct >= APPROACH_THRESHOLD:
+            current_command = 'VETO'
+
+        # ==========================================
+        # 4. EVENT-DRIVEN TERMINAL LOGGING & FILTER
+        # ==========================================
+        winner_sym = None
+
+        if current_command in ['STOP', '360', 'LEFT', 'RIGHT']:
+            print(f"\n📸 [DUEL] AI: {ai_label:<10} ({ai_conf_pct:>5.1f}%)   vs   TMP: {tmp_label:<10} ({tmp_conf_pct:>5.1f}%)")
+            
+            detection_history.append(current_command)
+            
+            if len(detection_history) > REQUIRED_DETECTIONS:
+                detection_history.pop(0)
+                
+            count = detection_history.count(current_command)
+            print(f"   ↳ 🏆 [WINNER] {current_command} takes the frame! ({count}/{REQUIRED_DETECTIONS})")
+            
+            if count >= REQUIRED_DETECTIONS:
+                print(f"   ✅ [EXECUTING] {current_command} command locked in!")
+                
+                if current_command == 'STOP':
+                    winner_sym = 'STOP'
+                elif current_command == '360':
+                    winner_sym = '360'
+                elif current_command == 'LEFT':
+                    winner_sym = 'LEFT'
+                elif current_command == 'RIGHT':
+                    winner_sym = 'RIGHT'
+                
+                detection_history.clear()
+                
+        elif current_command == 'VETO':
+            if tmp_conf_pct >= APPROACH_THRESHOLD:
+                print(f"\n📸 [DUEL] AI: {ai_label:<10} ({ai_conf_pct:>5.1f}%)   vs   TMP: {tmp_label:<10} ({tmp_conf_pct:>5.1f}%)")
+                print(f"   🛑 [VETO] AI confirms '{ai_label}'. Blocking false positive.")
+                
+            if len(detection_history) > 0:
+                detection_history.clear()
+        else:
+            if len(detection_history) > 0:
+                detection_history.clear()
+
+        with state.lock:
+            if winner_sym: state.detected_symbol = winner_sym
+            
+        time.sleep(0.2) 
+
+# ==========================================
+# THREAD 3: THE MUSCLES (20 Hz Motor Controller)
+# ==========================================
+def thread_motor_ctrl():
+    while state.running:
+        with state.lock:
+            sym = state.detected_symbol
+            l_speed = state.left_speed
+            r_speed = state.right_speed
+
+        if sym == 'STOP':
+            set_motor(-50, -50)
+            time.sleep(0.05)
+            set_motor(0, 0)
+            time.sleep(2.0) 
+            
+            print("\n>> ACTION: STOP SYMBOL DETECTED. Car is stopping for 2 seconds.")
+            with state.lock: 
+                state.detected_symbol = None 
+                state.ignore_ai_until = time.time() + 1.5 
+                state.ignore_tmp_until = time.time() + 1.5
+            
+            set_motor(30, 30) 
+            time.sleep(0.1)
+            set_motor(l_speed, r_speed)
+            
+        elif sym == '360':
+            set_motor(100, -100) 
+            time.sleep(1.35)        
+            
+            print("\n>> ACTION: RECYCLE SYMBOL DETECTED. Car executing 360 turn.")
+            with state.lock: 
+                state.detected_symbol = None 
+                state.ignore_ai_until = time.time() + 1.5  
+                state.ignore_tmp_until = time.time() + 1.5
+                
+        elif sym == 'LEFT':
+            set_motor(-100, 100) 
+            time.sleep(0.17) 
+            
+            print("\n>> ACTION: LEFT ARROW DETECTED. Executing 45-degree Left turn.")
+            with state.lock: 
+                state.detected_symbol = None 
+                state.ignore_tmp_until = time.time() + 1.5 
+                
+        elif sym == 'RIGHT':
+            set_motor(100, -100) 
+            time.sleep(0.17) 
+            
+            print("\n>> ACTION: RIGHT ARROW DETECTED. Executing 45-degree Right turn.")
+            with state.lock: 
+                state.detected_symbol = None 
+                state.ignore_tmp_until = time.time() + 1.5 
+
+        # --- THE FIX: NEW 90 DEGREE TURN WHEN RED EXITS ---
+        elif sym == 'RED_EXIT_RIGHT':
+            set_motor(100, -100) 
+            # 0.34s is precisely 1/4 of your 1.35s 360 turn
+            time.sleep(0.34) 
+            
+            print("\n>> ACTION: RED LINE EXIT DETECTED. Executing 90-degree Right turn.")
+            with state.lock: 
+                state.detected_symbol = None 
+                # Blind templates briefly to prevent false positives while sweeping
+                state.ignore_tmp_until = time.time() + 1.0 
+                
+        else:
+            set_motor(l_speed, r_speed)
+            
+        time.sleep(0.05) 
+
+# ==========================================
+# MAIN EXECUTION & GUI TEARDOWN
+# ==========================================
+if __name__ == '__main__':
+    print("\nStarting Competitive Threaded System...")
+    
+    threads = [
+        threading.Thread(target=thread_line_follow),
+        threading.Thread(target=thread_symbol_detect),
+        threading.Thread(target=thread_motor_ctrl)
+    ]
+    
+    for t in threads: t.start()
+    
+    try:
+        while state.running:
+            disp_frame = None
+            crop_frame = None
+            tmp_frame = None
+            text_overlay = ""
+            
+            with state.lock:
+                if state.display_frame is not None: disp_frame = state.display_frame.copy()
+                if state.ai_crop_frame is not None: crop_frame = state.ai_crop_frame.copy()
+                if state.tmp_display_frame is not None: tmp_frame = state.tmp_display_frame.copy()
+                text_overlay = state.ai_overlay_text
+                
+            if disp_frame is not None:
+                cv2.putText(disp_frame, text_overlay, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                cv2.imshow("Main Camera View", disp_frame)
+                
+            if crop_frame is not None:
+                cv2.imshow("What the AI Sees", crop_frame)
+
+            if tmp_frame is not None:
+                cv2.imshow("What Template Matching Sees", tmp_frame)
+
+            if cv2.waitKey(20) & 0xFF == ord('q'):
+                print("\nQuit command received.")
+                state.running = False
+                break
+                
+    except KeyboardInterrupt:
+        print("\nCtrl+C detected. Triggering graceful shutdown...")
+        state.running = False
+        
+    finally:
+        print("Joining threads...")
+        for t in threads: t.join()
+            
+        print("Cleaning up GPIO and Windows...")
+        cv2.destroyAllWindows()
+        GPIO.output([IN1, IN2, IN3, IN4], False)
+        pwm_left.stop()
+        pwm_right.stop()
+        GPIO.cleanup()
+        print("Shutdown complete. Goodbye!")
