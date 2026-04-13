@@ -1,0 +1,6 @@
+0 recycle
+1 qr code
+2 press button
+3 danger
+4 fingerprint
+5 background
