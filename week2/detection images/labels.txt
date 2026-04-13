@@ -1,0 +1,13 @@
+0 background
+1 danger
+2 recycle
+3 rhombus/diamond
+4 pressbutton
+5 hospital/cross
+6 pacman
+7 semicircle
+8 star
+9 qrcode
+10 fingerprint
+11 octagon
+12 trapezoid
